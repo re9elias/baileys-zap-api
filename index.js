@@ -1,5 +1,5 @@
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 
 const app = express();
@@ -15,34 +15,45 @@ let connectionStatus = 'DISCONNECTED';
 
 async function startSock() {
     const { state, saveCreds } = await useMultiFileAuthState('baileys_auth');
+
     sock = makeWASocket({
         auth: state,
-        printQRInTerminal: false
+        printQRInTerminal: false,
+        syncFullHistory: false,           // Evita transferir o histórico que causava o Time Out
+        defaultQueryTimeoutMs: undefined, // Desativa o tempo limite de 60s das consultas iniciais
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 15000,
+        browser: Browsers.appropriate('Desktop')
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
+
         if (qr) {
             qrBase64 = await QRCode.toDataURL(qr);
             connectionStatus = 'WAITING_QR';
         }
+
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            console.log(`⚠️ Ligação terminada (Status: ${statusCode}). A reiniciar: ${shouldReconnect}`);
             connectionStatus = 'DISCONNECTED';
-            if (shouldReconnect) startSock();
+            if (shouldReconnect) {
+                setTimeout(startSock, 3000); // Pausa de 3 segundos antes de restabelecer o socket
+            }
         } else if (connection === 'open') {
             connectionStatus = 'CONNECTED';
             qrBase64 = '';
-            console.log('✅ Sessão Baileys Conectada com Sucesso!');
+            console.log('✅ WhatsApp conectado e pronto para receber mensagens!');
         }
     });
 
     sock.ev.on('messages.upsert', async ({ messages }) => {
         for (const msg of messages) {
             if (msg.message) {
-                // Extrai o texto independentemente do tipo de mensagem do WhatsApp
                 const text = msg.message.conversation || 
                              msg.message.extendedTextMessage?.text || 
                              msg.message.imageMessage?.caption || 
@@ -52,8 +63,8 @@ async function startSock() {
                 const from = jid.replace('@s.whatsapp.net', '').replace('@g.us', '');
                 const direction = msg.key.fromMe ? 'enviada' : 'recebida';
 
-                if (text) {
-                    console.log(`📩 Nova mensagem detectada [${direction}] de ${from}: ${text}`);
+                if (text && from) {
+                    console.log(`📩 Mensagem capturada [${direction}] de ${from}: ${text}`);
                     try {
                         const response = await fetch(WEBHOOK_URL, {
                             method: 'POST',
@@ -68,7 +79,7 @@ async function startSock() {
                         const resText = await response.text();
                         console.log(`📡 Resposta do Webhook cPanel: ${resText}`);
                     } catch (e) {
-                        console.error('❌ Falha ao contactar o Webhook cPanel:', e.message);
+                        console.error('❌ Erro no envio para o Webhook cPanel:', e.message);
                     }
                 }
             }
