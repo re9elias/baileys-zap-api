@@ -35,27 +35,41 @@ async function startSock() {
         } else if (connection === 'open') {
             connectionStatus = 'CONNECTED';
             qrBase64 = '';
+            console.log('✅ Sessão Baileys Conectada com Sucesso!');
         }
     });
 
     sock.ev.on('messages.upsert', async ({ messages }) => {
         for (const msg of messages) {
-            if (!msg.key.fromMe && msg.message) {
-                const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
-                const from = msg.key.remoteJid ? msg.key.remoteJid.replace('@s.whatsapp.net', '') : '';
-                try {
-                    await fetch(WEBHOOK_URL, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            event: 'messages.upsert',
-                            from: from,
-                            content: text,
-                            timestamp: msg.messageTimestamp
-                        })
-                    });
-                } catch (e) {
-                    console.error('Falha no webhook:', e.message);
+            if (msg.message) {
+                // Extrai o texto independentemente do tipo de mensagem do WhatsApp
+                const text = msg.message.conversation || 
+                             msg.message.extendedTextMessage?.text || 
+                             msg.message.imageMessage?.caption || 
+                             '';
+
+                const jid = msg.key.remoteJid || '';
+                const from = jid.replace('@s.whatsapp.net', '').replace('@g.us', '');
+                const direction = msg.key.fromMe ? 'enviada' : 'recebida';
+
+                if (text) {
+                    console.log(`📩 Nova mensagem detectada [${direction}] de ${from}: ${text}`);
+                    try {
+                        const response = await fetch(WEBHOOK_URL, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                from: from,
+                                content: text,
+                                direcao: direction,
+                                timestamp: msg.messageTimestamp
+                            })
+                        });
+                        const resText = await response.text();
+                        console.log(`📡 Resposta do Webhook cPanel: ${resText}`);
+                    } catch (e) {
+                        console.error('❌ Falha ao contactar o Webhook cPanel:', e.message);
+                    }
                 }
             }
         }
@@ -77,5 +91,5 @@ app.post('/session/start', (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Baileys Lite rodando na porta ${PORT}`);
+    console.log(`Baileys Lite a correr na porta ${PORT}`);
 });
