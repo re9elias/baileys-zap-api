@@ -1,33 +1,48 @@
 const express = require('express');
+const fs = require('fs');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 const API_KEY = process.env.API_KEY || 'TokenSeguro123';
-const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://link.re9.rio.br/smart/webhook_whatsapp.php';
 
 let sock = null;
 let qrBase64 = '';
 let connectionStatus = 'DISCONNECTED';
 
-async function enviarParaMySQL(payload) {
-    try {
-        const response = await fetch(WEBHOOK_URL, {
-            method: 'POST',
-            headers: { 
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-            },
-            body: JSON.stringify(payload)
+// Filas em memoria para entregar direto ao os.php (Sem bloqueio de firewall)
+let filaMensagens = [];
+let filaContatos = [];
+
+function guardarContato(numero, nome) {
+    const limpo = String(numero || '').replace(/[^0-9]/g, '');
+    if (limpo.length >= 8 && !filaContatos.some(c => c.telefone === limpo)) {
+        filaContatos.push({
+            nome: nome || limpo,
+            telefone: limpo
         });
-        const texto = await response.text();
-        console.log(`📡 Sincronizado com MySQL:`, texto.substring(0, 120));
-    } catch (e) {
-        console.error('❌ Erro ao enviar para o MySQL:', e.message);
+        if (filaContatos.length > 500) filaContatos.shift();
     }
+}
+
+function guardarMensagem(jid, texto, fromMe, nomeContato) {
+    if (!jid || !texto || jid.includes('status@broadcast')) return;
+    const numero = jid.replace('@s.whatsapp.net', '').replace('@g.us', '');
+    const limpo = numero.replace(/[^0-9]/g, '');
+    if (!limpo) return;
+
+    if (nomeContato) guardarContato(limpo, nomeContato);
+
+    filaMensagens.push({
+        id_unico: Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+        from: limpo,
+        content: String(texto).trim(),
+        direcao: fromMe ? 'enviada' : 'recebida'
+    });
+    if (filaMensagens.length > 300) filaMensagens.shift();
 }
 
 async function startSock() {
@@ -36,23 +51,22 @@ async function startSock() {
     sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
-        syncFullHistory: true,            // Ativa o recebimento do histórico do aparelho
-        defaultQueryTimeoutMs: undefined, // Evita queda por Time Out
+        syncFullHistory: true,
+        shouldSyncHistoryMessage: () => true,
+        defaultQueryTimeoutMs: undefined,
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 15000,
-        browser: Browsers.macOS('Desktop') // Simula Desktop para receber mais histórico
+        browser: Browsers.macOS('Desktop')
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
-
         if (qr) {
             qrBase64 = await QRCode.toDataURL(qr);
             connectionStatus = 'WAITING_QR';
         }
-
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
@@ -61,104 +75,121 @@ async function startSock() {
         } else if (connection === 'open') {
             connectionStatus = 'CONNECTED';
             qrBase64 = '';
-            console.log('✅ Aparelho conectado e pronto!');
+            console.log('WhatsApp Conectado!');
         }
     });
 
-    // 1. CAPTURA O HISTÓRICO ANTIGO E CONTATOS AO CONECTAR
-    sock.ev.on('messaging-history.set', async ({ chats, contacts, messages }) => {
-        console.log(`📦 Recebendo pacote de histórico: ${messages.length} mensagens e ${contacts.length} contatos.`);
-        
-        const loteMensagens = [];
-        for (const msg of messages.slice(-100)) { // Pega as últimas 100 mensagens do histórico
-            if (msg.message) {
-                const text = msg.message.conversation || 
-                             msg.message.extendedTextMessage?.text || 
-                             msg.message.imageMessage?.caption || '';
-                const jid = msg.key.remoteJid || '';
-                if (text && jid && !jid.includes('@g.us') && !jid.includes('status@broadcast')) {
-                    loteMensagens.push({
-                        from: jid.replace('@s.whatsapp.net', ''),
-                        content: text,
-                        direcao: msg.key.fromMe ? 'enviada' : 'recebida'
-                    });
+    // 1. Captura pacote de historico e contatos ao parear
+    sock.ev.on('messaging-history.set', ({ contacts, messages }) => {
+        if (Array.isArray(contacts)) {
+            for (const c of contacts) {
+                if (c.id && c.id.includes('@s.whatsapp.net')) {
+                    guardarContato(c.id.replace('@s.whatsapp.net', ''), c.name || c.notify);
                 }
             }
         }
-
-        const loteContatos = [];
-        for (const c of contacts) {
-            if (c.id && c.id.includes('@s.whatsapp.net')) {
-                const numero = c.id.replace('@s.whatsapp.net', '');
-                const nome = c.name || c.notify || numero;
-                loteContatos.push({ nome, telefone: numero });
+        if (Array.isArray(messages)) {
+            for (const msg of messages.slice(-150)) {
+                if (msg.message) {
+                    const text = msg.message.conversation ||
+                                 msg.message.extendedTextMessage?.text ||
+                                 msg.message.imageMessage?.caption || '';
+                    if (text) {
+                        guardarMensagem(msg.key.remoteJid, text, msg.key.fromMe, msg.pushName);
+                    }
+                }
             }
-        }
-
-        if (loteMensagens.length > 0 || loteContatos.length > 0) {
-            await enviarParaMySQL({
-                acao: 'sincronizar_lote',
-                mensagens: loteMensagens,
-                contatos: loteContatos
-            });
         }
     });
 
-    // 2. CAPTURA MENSAGENS EM TEMPO REAL (RECEBIDAS E ENVIADAS)
-    sock.ev.on('messages.upsert', async ({ messages }) => {
+    // 2. Captura contatos atualizados
+    sock.ev.on('contacts.upsert', (contacts) => {
+        for (const c of contacts) {
+            if (c.id && c.id.includes('@s.whatsapp.net')) {
+                guardarContato(c.id.replace('@s.whatsapp.net', ''), c.name || c.notify);
+            }
+        }
+    });
+
+    // 3. Captura todas as mensagens recebidas e enviadas em tempo real
+    sock.ev.on('messages.upsert', ({ messages }) => {
         for (const msg of messages) {
             if (msg.message) {
-                const text = msg.message.conversation || 
-                             msg.message.extendedTextMessage?.text || 
+                const text = msg.message.conversation ||
+                             msg.message.extendedTextMessage?.text ||
                              msg.message.imageMessage?.caption || '';
-                const jid = msg.key.remoteJid || '';
-                if (jid.includes('status@broadcast')) continue;
-
-                const from = jid.replace('@s.whatsapp.net', '').replace('@g.us', '');
-                const direction = msg.key.fromMe ? 'enviada' : 'recebida';
-
-                if (text && from) {
-                    await enviarParaMySQL({
-                        acao: 'nova_mensagem',
-                        from: from,
-                        content: text,
-                        direcao: direction
-                    });
+                if (text) {
+                    guardarMensagem(msg.key.remoteJid, text, msg.key.fromMe, msg.pushName);
                 }
             }
         }
     });
 }
 
-// Iniciar ou checar sessão
+// Rota principal: entrega status, QR Code e despeja a fila de mensagens/contatos direto no os.php
 app.post('/session/start', (req, res) => {
     const key = req.headers['x-api-key'];
-    if (key !== API_KEY) return res.status(401).json({ error: 'Chave inválida' });
+    if (key !== API_KEY) return res.status(401).json({ error: 'Chave invalida' });
 
     if (!sock && connectionStatus !== 'CONNECTED') {
         startSock();
     }
-    return res.json({ status: connectionStatus, qrcode: qrBase64 });
+
+    const msgsParaEntregar = [...filaMensagens];
+    const contatosParaEntregar = [...filaContatos];
+
+    // Limpa a fila apos entregar ao os.php para nao duplicar
+    filaMensagens = [];
+    filaContatos = [];
+
+    return res.json({
+        status: connectionStatus,
+        qrcode: qrBase64,
+        mensagens: msgsParaEntregar,
+        contatos: contatosParaEntregar
+    });
 });
 
-// NOVA ROTA: Enviar mensagem pelo navegador sem precisar do celular físico
+// Rota para resetar sessao e forcar novo download de historico via QR Code
+app.post('/session/reset', async (req, res) => {
+    const key = req.headers['x-api-key'];
+    if (key !== API_KEY) return res.status(401).json({ error: 'Chave invalida' });
+    try {
+        if (sock) {
+            await sock.logout();
+            sock = null;
+        }
+    } catch (e) {}
+    try {
+        fs.rmSync('baileys_auth', { recursive: true, force: true });
+    } catch (e) {}
+    connectionStatus = 'DISCONNECTED';
+    qrBase64 = '';
+    startSock();
+    return res.json({ status: 'RESET_OK' });
+});
+
+// Rota para enviar mensagem pelo navegador
 app.post('/message/send', async (req, res) => {
     const key = req.headers['x-api-key'];
-    if (key !== API_KEY) return res.status(401).json({ error: 'Chave inválida' });
+    if (key !== API_KEY) return res.status(401).json({ error: 'Chave invalida' });
 
     const { telefone, mensagem } = req.body;
     if (!sock || connectionStatus !== 'CONNECTED') {
-        return res.status(400).json({ error: 'WhatsApp não está conectado' });
+        return res.status(400).json({ error: 'WhatsApp desconectado' });
     }
-
     try {
-        const numeroLimpo = telefone.replace(/[^0-9]/g, '');
-        const jid = `${numeroLimpo}@s.whatsapp.net`;
-        await sock.sendMessage(jid, { text: mensagem });
-        return res.json({ status: 'enviada', telefone: numeroLimpo });
+        const limpo = String(telefone).replace(/[^0-9]/g, '');
+        await sock.sendMessage(`${limpo}@s.whatsapp.net`, { text: mensagem });
+        return res.json({ status: 'enviada' });
     } catch (e) {
         return res.status(500).json({ error: e.message });
     }
+});
+
+app.listen(PORT, () => {
+    console.log(`Servidor Baileys rodando na porta ${PORT}`);
+    startSock();
 });
 
 app.listen(PORT, () => {
